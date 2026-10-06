@@ -79,3 +79,22 @@ The console summary reports installation duration, successful updates, updates c
 | `3010` | A restart is required; review individual results because updates may also have reported errors. |
 
 The original process does not wait for the elevated copy, so its exit code does not represent the completed update operation. For automation that needs the final result, start the script in an already elevated session.
+
+
+
+
+# windate startup menu
+
+Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windate_2.1.ps1`.
+The menu appears before elevation, scanning, or installing updates. Toggle options 1–5, press S to start, or Q to quit. All optional settings start disabled.
+
+The single `windate_2.1.ps1` file contains its runner and Windows Update code, so it also supports `irm <your HTTPS raw script URL> | iex` after you publish it. It writes a temporary runner for UAC elevation and cleans up after the process finishes. No download URL has been deployed yet. The readable runner and core are included for review; they are not additional launcher dependencies.
+
+Hidden Windows updates require individual selection, then the normal installation confirmation. Only confirmed updates are unhidden, and their EULAs are accepted before download. Optional/driver classification still controls selection.
+
+Lenovo updates require Lenovo Commercial Vantage plus the separately installed SU Helper. Consumer Vantage alone is insufficient. Setup: https://docs.lenovocdrt.com/guides/lcv/suhelper/ . Drivers use package type 2; the firmware option adds types 3 and 4. Reboot types 1 and 4 (forced restart/shutdown) are excluded. SU Helper triggers an asynchronous session; a successful launch does not mean updates finished. Review completion and results in Vantage. The launcher does not automatically install these prerequisites.
+
+Automatic Windows restart is disabled whenever Lenovo is selected. Lenovo uses reboot types 0,3,5 with -noreboot. BIOS/firmware requires separate menu confirmation. Windows Update errors/cancellation do not prevent the independently selected Lenovo step; it has its own confirmation.
+
+Validation: source transformation and embedded payload consistency checked locally. Windows COM, UAC, hidden update installation, and Lenovo integration require testing on Windows; no Windows runtime was available here.
+
