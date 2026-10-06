@@ -1,1454 +1,1454 @@
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Verbose, interactive Windows Update installer with automatic UAC elevation.
-
+    windate: interactive Windows and Lenovo update menu.
 .DESCRIPTION
-    Searches Windows Update and displays:
-
-        Required Updates
-        Optional Updates
-        Drivers
-
-    Required updates are selected by default.
-
-    Use -Include_Optional to also select optional updates
-    and drivers.
-
-    Use -Auto_Reboot to automatically restart Windows when
-    a reboot is required by this update operation.
-
-    If the script is started without Administrator privileges,
-    it automatically requests elevation through UAC.
-
-    The original non-administrator PowerShell process exits
-    immediately after launching the elevated copy.
-
-    Existing pending reboots do NOT automatically trigger a
-    reboot before searching for updates.
-
-.PARAMETER Include_Optional
-    Includes optional updates and driver updates.
-
-.PARAMETER Auto_Reboot
-    Automatically restarts Windows when the update operation
-    requires a reboot.
-
-.EXAMPLES
-
-    Required updates only:
-        .\windate.ps1
-
-    Required + optional + drivers:
-        .\windate.ps1 -Include_Optional
-
-    Required + optional + drivers + automatic reboot:
-        .\windate.ps1 -Include_Optional -Auto_Reboot
-
-.EXIT CODES
-
-    0     Success
-    1     Not Administrator / UAC cancelled / startup failure
-    2     Windows Update initialization failure
-    3     Windows Update search failure
-    10    User cancelled
-    20    Download operation failure
-    21    No selected updates downloaded successfully
-    30    Installation operation failure
-    40    One or more updates failed or could not be downloaded
-    3010  Success, reboot required
+    One readable script for local execution or irm <hosted HTTPS URL> | iex.
+    Optional Windows updates, hidden updates, Lenovo drivers, BIOS/firmware,
+    and automatic Windows restart are configured before scanning starts.
+    Lenovo requires Commercial Vantage and SU Helper. Firmware is opt-in.
+    Internal worker modes isolate Windows Update exit codes from the menu.
 #>
-
 [CmdletBinding()]
 param(
-    [switch]$Include_Optional,
-
-    [switch]$Auto_Reboot
+    [ValidateSet('Menu','Run','Windows')][string]$Mode = 'Menu',
+    [switch]$Optional, [switch]$Hidden, [switch]$Lenovo,
+    [switch]$Firmware, [switch]$Reboot
 )
 
-$ErrorActionPreference = "Stop"
+function Invoke-Windate {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Menu','Run','Windows')][string]$Mode = 'Menu',
+        [switch]$Optional,
+        [switch]$Hidden,
+        [switch]$Lenovo,
+        [switch]$Firmware,
+        [switch]$Reboot
+    )
 
-# ============================================================
-# SELF-ELEVATION
-# ============================================================
-#
-# The script intentionally does NOT use:
-#
-#     #requires -RunAsAdministrator
-#
-# because #requires would terminate the script before it could
-# request UAC elevation itself.
-#
-# Instead, the script checks the current process and relaunches
-# itself with "RunAs" when necessary.
-# ============================================================
+    function Invoke-WindowsUpdate {
+        <#
+        .SYNOPSIS
+            Verbose, interactive Windows Update installer with automatic UAC elevation.
 
-function Test-IsAdministrator {
+        .DESCRIPTION
+            Searches Windows Update and displays:
 
-    try {
+                Required Updates
+                Optional Updates
+                Drivers
 
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            Required updates are selected by default.
 
-        $principal = New-Object Security.Principal.WindowsPrincipal(
-            $identity
+            Use -Include_Optional to also select optional updates
+            and drivers.
+
+            Use -Auto_Reboot to automatically restart Windows when
+            a reboot is required by this update operation.
+
+            If the script is started without Administrator privileges,
+            it automatically requests elevation through UAC.
+
+            The original non-administrator PowerShell process exits
+            immediately after launching the elevated copy.
+
+            Existing pending reboots do NOT automatically trigger a
+            reboot before searching for updates.
+
+        .PARAMETER Include_Optional
+            Includes optional updates and driver updates.
+
+        .PARAMETER Auto_Reboot
+            Automatically restarts Windows when the update operation
+            requires a reboot.
+
+        .EXAMPLES
+
+            Required updates only:
+                .\windate.ps1
+
+            Required + optional + drivers:
+                .\windate.ps1 -Include_Optional
+
+            Required + optional + drivers + automatic reboot:
+                .\windate.ps1 -Include_Optional -Auto_Reboot
+
+        .EXIT CODES
+
+            0     Success
+            1     Not Administrator / UAC cancelled / startup failure
+            2     Windows Update initialization failure
+            3     Windows Update search failure
+            10    User cancelled
+            20    Download operation failure
+            21    No selected updates downloaded successfully
+            30    Installation operation failure
+            40    One or more updates failed or could not be downloaded
+            3010  Success, reboot required
+        #>
+
+        [CmdletBinding()]
+        param(
+            [switch]$Include_Optional,
+
+            [switch]$Include_Hidden,
+            [switch]$Auto_Reboot
         )
 
-        return $principal.IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator
-        )
-    }
-    catch {
+        $ErrorActionPreference = "Stop"
 
-        return $false
-    }
-}
-
-if (-not (Test-IsAdministrator)) {
-
-    $scriptPath = $MyInvocation.MyCommand.Path
-
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-
-        Write-Host ""
-        Write-Host "============================================================" `
-            -ForegroundColor Red
-
-        Write-Host `
-            "             WINDOWS UPDATE - STARTUP ERROR" `
-            -ForegroundColor Red
-
-        Write-Host "============================================================" `
-            -ForegroundColor Red
-
-        Write-Host ""
-
-        Write-Host `
-            "Unable to determine the path of this script." `
-            -ForegroundColor Yellow
-
-        Write-Host `
-            "Save the script as a .ps1 file and run it again." `
-            -ForegroundColor Yellow
-
-        Write-Host ""
-
-        exit 1
-    }
-
-    # Resolve the full path in case the script was started
-    # using a relative path.
-    try {
-
-        $scriptPath = (Resolve-Path $scriptPath).Path
-    }
-    catch {
-
-        Write-Host ""
-        Write-Host `
-            "Unable to resolve the script path." `
-            -ForegroundColor Red
-
-        exit 1
-    }
-
-    # Determine which PowerShell executable should be used.
-    #
-    # Windows PowerShell:
-    #     powershell.exe
-    #
-    # If the script is running under another compatible host,
-    # fall back to powershell.exe for maximum compatibility.
-    $powerShellExe = "powershell.exe"
-
-    # Build the argument list for the elevated copy.
-    $argumentList = @(
-        "-NoProfile"
-        "-ExecutionPolicy"
-        "Bypass"
-        "-File"
-        "`"$scriptPath`""
-    )
-
-    # Preserve command-line switches.
-    if ($Include_Optional) {
-
-        $argumentList += "-Include_Optional"
-    }
-
-    if ($Auto_Reboot) {
-
-        $argumentList += "-Auto_Reboot"
-    }
-
-    Write-Host ""
-    Write-Host "============================================================" `
-        -ForegroundColor Cyan
-
-    Write-Host `
-        "             WINDOWS UPDATE - ELEVATION" `
-        -ForegroundColor Cyan
-
-    Write-Host "============================================================" `
-        -ForegroundColor Cyan
-
-    Write-Host ""
-
-    Write-Host `
-        "Administrator privileges are required." `
-        -ForegroundColor Yellow
-
-    Write-Host `
-        "Requesting elevation through Windows UAC..." `
-        -ForegroundColor Gray
-
-    Write-Host ""
-
-    try {
-
-        # Launch an elevated copy of this exact script.
+        # ============================================================
+        # SELF-ELEVATION
+        # ============================================================
         #
-        # -Verb RunAs causes Windows to display the UAC prompt.
-        # -PassThru gives us the newly created process object.
-        $elevatedProcess = Start-Process `
-            -FilePath $powerShellExe `
-            -ArgumentList $argumentList `
-            -Verb RunAs `
-            -PassThru
+        # The script intentionally does NOT use:
+        #
+        #     #requires -RunAsAdministrator
+        #
+        # because #requires would terminate the script before it could
+        # request UAC elevation itself.
+        #
+        # Instead, the script checks the current process and relaunches
+        # itself with "RunAs" when necessary.
+        # ============================================================
 
-        if ($null -eq $elevatedProcess) {
+        function Test-IsAdministrator {
 
-            throw "Windows did not return an elevated process."
+            try {
+
+                $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+                $principal = New-Object Security.Principal.WindowsPrincipal(
+                    $identity
+                )
+
+                return $principal.IsInRole(
+                    [Security.Principal.WindowsBuiltInRole]::Administrator
+                )
+            }
+            catch {
+
+                return $false
+            }
         }
 
-        Write-Host `
-            "Elevated PowerShell process started." `
-            -ForegroundColor Green
-
-        Write-Host `
-            "Closing the original non-administrator window..." `
-            -ForegroundColor Gray
-
-        # The original non-elevated process terminates here.
+        # SCRIPT IS NOW ELEVATED
+        # ============================================================
         #
-        # The elevated process continues independently.
-        exit 0
-    }
-    catch {
+        # Nothing below this point executes in the original
+        # non-administrator process.
+        # ============================================================
 
-        Write-Host ""
+        # ============================================================
+        # DISPLAY FUNCTIONS
+        # ============================================================
 
-        Write-Host "============================================================" `
-            -ForegroundColor Red
-
-        Write-Host `
-            "              ELEVATION CANCELLED" `
-            -ForegroundColor Red
-
-        Write-Host "============================================================" `
-            -ForegroundColor Red
-
-        Write-Host ""
-
-        Write-Host `
-            "Administrator elevation was cancelled or failed." `
-            -ForegroundColor Yellow
-
-        Write-Host ""
-
-        Write-Host `
-            "Windows Update was not started." `
-            -ForegroundColor Gray
-
-        Write-Host ""
-
-        exit 1
-    }
-}
-
-# ============================================================
-# SCRIPT IS NOW ELEVATED
-# ============================================================
-#
-# Nothing below this point executes in the original
-# non-administrator process.
-# ============================================================
-
-# ============================================================
-# DISPLAY FUNCTIONS
-# ============================================================
-
-function Write-Step {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    Write-Host ""
-    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] " `
-        -NoNewline `
-        -ForegroundColor DarkGray
-
-    Write-Host $Message -ForegroundColor Cyan
-}
-
-function Write-Info {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    Write-Host "    $Message" -ForegroundColor Gray
-}
-
-function Write-Success {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    Write-Host "    $Message" -ForegroundColor Green
-}
-
-function Write-WarningMessage {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    Write-Host "    $Message" -ForegroundColor Yellow
-}
-
-function Write-Failure {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    Write-Host "    $Message" -ForegroundColor Red
-}
-
-function Write-UpdateEntry {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    $kb = Get-KB $Update
-    $size = Get-SizeMB $Update
-
-    Write-Host "  ● " `
-        -NoNewline `
-        -ForegroundColor Yellow
-
-    if ($kb) {
-
-        Write-Host "$kb " `
-            -NoNewline `
-            -ForegroundColor Yellow
-    }
-
-    Write-Host $Update.Title -ForegroundColor White
-
-    if ($size -gt 0) {
-
-        Write-Host "      Size: $size MB" `
-            -ForegroundColor DarkGray
-    }
-}
-
-# ============================================================
-# UPDATE HELPERS
-# ============================================================
-
-function Get-KB {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    try {
-
-        if ($null -ne $Update.KBArticleIDs -and
-            $Update.KBArticleIDs.Count -gt 0) {
-
-            return "KB$($Update.KBArticleIDs.Item(0))"
-        }
-    }
-    catch {
-        # Some updates do not expose KBArticleIDs.
-    }
-
-    return ""
-}
-
-function Get-SizeMB {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    try {
-
-        if ($Update.MaxDownloadSize -gt 0) {
-
-            return [math]::Round(
-                $Update.MaxDownloadSize / 1MB,
-                1
+        function Write-Step {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Message
             )
-        }
-    }
-    catch {
-        # Some updates do not expose download size.
-    }
 
-    return 0
-}
+            Write-Host ""
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] " `
+                -NoNewline `
+                -ForegroundColor DarkGray
 
-function Test-DriverUpdate {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    try {
-
-        # Windows Update Agent:
-        #
-        # 1 = Software
-        # 2 = Driver
-
-        return ([int]$Update.Type -eq 2)
-    }
-    catch {
-
-        return $false
-    }
-}
-
-function Test-OptionalUpdate {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    # BrowseOnly is the primary WUA indication that an update
-    # is not normally offered as an automatic/required update.
-
-    try {
-
-        if ([bool]$Update.BrowseOnly) {
-
-            return $true
-        }
-    }
-    catch {
-    }
-
-    return $false
-}
-
-function Get-UpdateType {
-    param(
-        [Parameter(Mandatory)]
-        $Update
-    )
-
-    # Drivers are classified separately before optional status.
-
-    if (Test-DriverUpdate $Update) {
-
-        return "Driver"
-    }
-
-    if (Test-OptionalUpdate $Update) {
-
-        return "Optional"
-    }
-
-    return "Required"
-}
-
-# ============================================================
-# REBOOT DETECTION
-# ============================================================
-
-function Test-PendingReboot {
-
-    $paths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-    )
-
-    foreach ($path in $paths) {
-
-        if (Test-Path $path) {
-
-            return $true
-        }
-    }
-
-    return $false
-}
-
-# ============================================================
-# AUTOMATIC REBOOT
-# ============================================================
-
-function Start-UpdateReboot {
-
-    Write-Host ""
-
-    Write-WarningMessage `
-        "Windows needs to restart to finish applying updates."
-
-    if (-not $Auto_Reboot) {
-
-        Write-WarningMessage `
-            "Automatic reboot is disabled."
-
-        Write-WarningMessage `
-            "Restart Windows manually when convenient."
-
-        return $false
-    }
-
-    Write-Host ""
-
-    for ($seconds = 15; $seconds -gt 0; $seconds--) {
-
-        Write-Host `
-            "`r    Restarting in $seconds seconds... " `
-            -NoNewline `
-            -ForegroundColor Yellow
-
-        Start-Sleep -Seconds 1
-    }
-
-    Write-Host ""
-    Write-Host ""
-
-    Write-WarningMessage `
-        "Restarting computer..."
-
-    Restart-Computer -Force
-
-    return $true
-}
-
-# ============================================================
-# HEADER
-# ============================================================
-
-Clear-Host
-
-Write-Host ""
-Write-Host "============================================================" `
-    -ForegroundColor Cyan
-
-Write-Host "                  WINDOWS UPDATE" `
-    -ForegroundColor Cyan
-
-Write-Host "============================================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
-
-Write-Info "Computer : $env:COMPUTERNAME"
-Write-Info "Started  : $(Get-Date)"
-
-if ($Include_Optional) {
-
-    Write-Info "Optional : Included"
-}
-else {
-
-    Write-Info "Optional : Not selected"
-}
-
-if ($Auto_Reboot) {
-
-    Write-Info "Reboot   : Automatic when required"
-}
-else {
-
-    Write-Info "Reboot   : Manual"
-}
-
-Write-Info "Elevated : Administrator"
-
-# ============================================================
-# ADMIN CHECK
-# ============================================================
-#
-# This is a safety check only.
-#
-# The actual elevation occurred at the beginning of the script.
-# If this check fails, something unexpected happened.
-# ============================================================
-
-Write-Step "Verifying administrator privileges..."
-
-if (-not (Test-IsAdministrator)) {
-
-    Write-Failure `
-        "Administrator privileges were not detected."
-
-    Write-Failure `
-        "Windows Update cannot continue."
-
-    exit 1
-}
-
-Write-Success `
-    "Administrator privileges confirmed."
-
-# ============================================================
-# EXISTING REBOOT CHECK
-# ============================================================
-
-Write-Step "Checking for a pending reboot..."
-
-$existingPendingReboot = Test-PendingReboot
-
-if ($existingPendingReboot) {
-
-    Write-WarningMessage `
-        "Windows currently reports a pending reboot."
-
-    Write-WarningMessage `
-        "The script will not automatically reboot at this stage."
-
-    if ($Auto_Reboot) {
-
-        Write-Info `
-            "Automatic reboot will only occur if the current update operation requires it."
-    }
-}
-else {
-
-    Write-Success `
-        "No pending reboot detected."
-}
-
-# ============================================================
-# WINDOWS UPDATE SESSION
-# ============================================================
-
-Write-Step "Connecting to Windows Update..."
-
-try {
-
-    $session = New-Object -ComObject Microsoft.Update.Session
-
-    $session.ClientApplicationID = `
-        "PowerShell Windows Updater"
-
-    $searcher = $session.CreateUpdateSearcher()
-
-    $searcher.Online = $true
-}
-catch {
-
-    Write-Failure `
-        "Could not initialize Windows Update."
-
-    Write-Failure `
-        $_.Exception.Message
-
-    exit 2
-}
-
-Write-Success `
-    "Windows Update Agent initialized."
-
-# ============================================================
-# SEARCH
-# ============================================================
-
-Write-Step "Searching Windows Update..."
-
-Write-Info "Online search: enabled"
-Write-Info "Hidden updates: excluded"
-Write-Info "Installed updates: excluded"
-
-Write-Host ""
-
-$searchStart = Get-Date
-
-try {
-
-    $searchResult = $searcher.Search(
-        "IsInstalled=0 and IsHidden=0"
-    )
-}
-catch {
-
-    Write-Failure `
-        "Windows Update search failed."
-
-    Write-Failure `
-        $_.Exception.Message
-
-    exit 3
-}
-
-$searchSeconds = [math]::Round(
-    ((Get-Date) - $searchStart).TotalSeconds,
-    1
-)
-
-$allUpdates = $searchResult.Updates
-
-Write-Success `
-    "Search completed."
-
-Write-Info `
-    "Search time: $searchSeconds seconds"
-
-Write-Info `
-    "Updates found: $($allUpdates.Count)"
-
-# ============================================================
-# CATEGORIZE UPDATES
-# ============================================================
-
-Write-Step "Categorizing updates..."
-
-$requiredUpdates = `
-    New-Object -ComObject Microsoft.Update.UpdateColl
-
-$optionalUpdates = `
-    New-Object -ComObject Microsoft.Update.UpdateColl
-
-$driverUpdates = `
-    New-Object -ComObject Microsoft.Update.UpdateColl
-
-foreach ($update in $allUpdates) {
-
-    $type = Get-UpdateType $update
-
-    switch ($type) {
-
-        "Driver" {
-
-            [void]$driverUpdates.Add($update)
+            Write-Host $Message -ForegroundColor Cyan
         }
 
-        "Optional" {
+        function Write-Info {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Message
+            )
 
-            [void]$optionalUpdates.Add($update)
+            Write-Host "    $Message" -ForegroundColor Gray
         }
 
-        default {
+        function Write-Success {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Message
+            )
 
-            [void]$requiredUpdates.Add($update)
+            Write-Host "    $Message" -ForegroundColor Green
         }
-    }
-}
 
-Write-Success `
-    "Categorization complete."
+        function Write-WarningMessage {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Message
+            )
+
+            Write-Host "    $Message" -ForegroundColor Yellow
+        }
+
+        function Write-Failure {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Message
+            )
+
+            Write-Host "    $Message" -ForegroundColor Red
+        }
+
+        function Write-UpdateEntry {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
+
+            $kb = Get-KB $Update
+            $size = Get-SizeMB $Update
+
+            Write-Host "  ● " `
+                -NoNewline `
+                -ForegroundColor Yellow
 
-# ============================================================
-# DISPLAY REQUIRED
-# ============================================================
+            if ($kb) {
+
+                Write-Host "$kb " `
+                    -NoNewline `
+                    -ForegroundColor Yellow
+            }
+
+            Write-Host $Update.Title -ForegroundColor White
 
-Write-Host ""
-Write-Host "WINDOWS UPDATE" -ForegroundColor White
+            if ($size -gt 0) {
+
+                Write-Host "      Size: $size MB" `
+                    -ForegroundColor DarkGray
+            }
+        }
 
-Write-Host "------------------------------------------------------------" `
-    -ForegroundColor DarkGray
+        # ============================================================
+        # UPDATE HELPERS
+        # ============================================================
 
-Write-Host ""
-Write-Host "Required Updates" -ForegroundColor Cyan
+        function Get-KB {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
 
-if ($requiredUpdates.Count -eq 0) {
+            try {
 
-    Write-Host "  None" -ForegroundColor DarkGray
-}
-else {
+                if ($null -ne $Update.KBArticleIDs -and
+                    $Update.KBArticleIDs.Count -gt 0) {
 
-    for (
-        $i = 0;
-        $i -lt $requiredUpdates.Count;
-        $i++
-    ) {
+                    return "KB$($Update.KBArticleIDs.Item(0))"
+                }
+            }
+            catch {
+                # Some updates do not expose KBArticleIDs.
+            }
 
-        $update = $requiredUpdates.Item($i)
+            return ""
+        }
 
-        Write-UpdateEntry $update
-    }
-}
+        function Get-SizeMB {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
 
-# ============================================================
-# DISPLAY OPTIONAL
-# ============================================================
+            try {
 
-Write-Host ""
-Write-Host "Optional Updates" -ForegroundColor Cyan
+                if ($Update.MaxDownloadSize -gt 0) {
 
-if ($optionalUpdates.Count -eq 0) {
+                    return [math]::Round(
+                        $Update.MaxDownloadSize / 1MB,
+                        1
+                    )
+                }
+            }
+            catch {
+                # Some updates do not expose download size.
+            }
 
-    Write-Host "  None" -ForegroundColor DarkGray
-}
-else {
+            return 0
+        }
 
-    for (
-        $i = 0;
-        $i -lt $optionalUpdates.Count;
-        $i++
-    ) {
+        function Test-DriverUpdate {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
 
-        $update = $optionalUpdates.Item($i)
+            try {
 
-        Write-UpdateEntry $update
-    }
-}
+                # Windows Update Agent:
+                #
+                # 1 = Software
+                # 2 = Driver
 
-# ============================================================
-# DISPLAY DRIVERS
-# ============================================================
+                return ([int]$Update.Type -eq 2)
+            }
+            catch {
 
-Write-Host ""
-Write-Host "Drivers" -ForegroundColor Cyan
+                return $false
+            }
+        }
 
-if ($driverUpdates.Count -eq 0) {
+        function Test-OptionalUpdate {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
 
-    Write-Host "  None" -ForegroundColor DarkGray
-}
-else {
+            # BrowseOnly is the primary WUA indication that an update
+            # is not normally offered as an automatic/required update.
 
-    for (
-        $i = 0;
-        $i -lt $driverUpdates.Count;
-        $i++
-    ) {
+            try {
 
-        $update = $driverUpdates.Item($i)
+                if ([bool]$Update.BrowseOnly) {
 
-        Write-UpdateEntry $update
-    }
-}
+                    return $true
+                }
+            }
+            catch {
+            }
 
-# ============================================================
-# SUMMARY
-# ============================================================
+            return $false
+        }
 
-Write-Host ""
-Write-Host "Available Updates:" -ForegroundColor Cyan
+        function Get-UpdateType {
+            param(
+                [Parameter(Mandatory)]
+                $Update
+            )
 
-Write-Host "  Required:         $($requiredUpdates.Count)"
-Write-Host "  Optional:         $($optionalUpdates.Count)"
-Write-Host "  Drivers:          $($driverUpdates.Count)"
+            # Drivers are classified separately before optional status.
 
-# ============================================================
-# NOTHING FOUND
-# ============================================================
+            if (Test-DriverUpdate $Update) {
 
-if (
-    $requiredUpdates.Count -eq 0 -and
-    $optionalUpdates.Count -eq 0 -and
-    $driverUpdates.Count -eq 0
-) {
+                return "Driver"
+            }
 
-    Write-Host ""
+            if (Test-OptionalUpdate $Update) {
 
-    Write-Host `
-        "============================================================" `
-        -ForegroundColor Green
+                return "Optional"
+            }
 
-    Write-Host `
-        "                WINDOWS IS UP TO DATE" `
-        -ForegroundColor Green
+            return "Required"
+        }
 
-    Write-Host `
-        "============================================================" `
-        -ForegroundColor Green
+        # ============================================================
+        # REBOOT DETECTION
+        # ============================================================
 
-    Write-Host ""
+        function Test-PendingReboot {
 
-    exit 0
-}
+            $paths = @(
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+            )
 
-# ============================================================
-# BUILD INSTALLATION LIST
-# ============================================================
+            foreach ($path in $paths) {
 
-$updatesToInstall = `
-    New-Object -ComObject Microsoft.Update.UpdateColl
+                if (Test-Path $path) {
 
-# Required updates are always selected.
+                    return $true
+                }
+            }
 
-foreach ($update in $requiredUpdates) {
+            return $false
+        }
 
-    [void]$updatesToInstall.Add($update)
-}
+        # ============================================================
+        # AUTOMATIC REBOOT
+        # ============================================================
 
-# Optional updates and drivers require -Include_Optional.
+        function Start-UpdateReboot {
 
-if ($Include_Optional) {
-
-    foreach ($update in $optionalUpdates) {
-
-        [void]$updatesToInstall.Add($update)
-    }
-
-    foreach ($update in $driverUpdates) {
-
-        [void]$updatesToInstall.Add($update)
-    }
-}
-
-Write-Host ""
-
-Write-Host `
-    "Selected for installation: $($updatesToInstall.Count)" `
-    -ForegroundColor Cyan
-
-if (-not $Include_Optional) {
-
-    Write-Info `
-        "Optional updates and drivers are displayed but not selected."
-
-    Write-Info `
-        "Use -Include-Optional to install them."
-}
-
-# ============================================================
-# NOTHING SELECTED
-# ============================================================
-
-if ($updatesToInstall.Count -eq 0) {
-
-    Write-Host ""
-
-    Write-WarningMessage `
-        "No updates are selected for installation."
-
-    Write-Info `
-        "Use -Include-Optional if you want to install optional updates and drivers."
-
-    exit 0
-}
-
-# ============================================================
-# CONFIRMATION
-# ============================================================
-
-Write-Host ""
-
-Write-Host `
-    "Install selected updates? [Y/N] " `
-    -NoNewline `
-    -ForegroundColor Yellow
-
-$answer = Read-Host
-
-if ($answer -notmatch "^[Yy]$") {
-
-    Write-Host ""
-
-    Write-WarningMessage `
-        "Installation cancelled by user."
-
-    exit 10
-}
-
-# ============================================================
-# DOWNLOAD PREPARATION
-# ============================================================
-
-Write-Step "Preparing updates..."
-
-$updatesNeedingEula = 0
-
-foreach ($update in $updatesToInstall) {
-
-    try {
-
-        if (-not $update.EulaAccepted) {
+            Write-Host ""
 
             Write-WarningMessage `
-                "EULA not yet accepted:"
+                "Windows needs to restart to finish applying updates."
 
-            Write-Info `
-                $update.Title
+            if (-not $Auto_Reboot) {
 
-            Write-Info `
-                "Windows Update will handle EULA requirements during installation."
+                Write-WarningMessage `
+                    "Automatic reboot is disabled."
 
-            $updatesNeedingEula++
-        }
-    }
-    catch {
-        # Some updates may not expose EulaAccepted.
-    }
-}
+                Write-WarningMessage `
+                    "Restart Windows manually when convenient."
 
-if ($updatesNeedingEula -gt 0) {
+                return $false
+            }
 
-    Write-Info `
-        "$updatesNeedingEula update(s) report an unaccepted EULA."
-}
+            Write-Host ""
 
-Write-Success `
-    "Updates prepared."
+            for ($seconds = 15; $seconds -gt 0; $seconds--) {
 
-# ============================================================
-# DOWNLOAD
-# ============================================================
+                Write-Host `
+                    "`r    Restarting in $seconds seconds... " `
+                    -NoNewline `
+                    -ForegroundColor Yellow
 
-Write-Step "Downloading updates..."
+                Start-Sleep -Seconds 1
+            }
 
-Write-Info `
-    "Updates selected: $($updatesToInstall.Count)"
-
-Write-Info `
-    "Windows Update is downloading the required files."
-
-$downloader = $session.CreateUpdateDownloader()
-
-$downloader.Updates = $updatesToInstall
-
-$downloadStart = Get-Date
-
-try {
-
-    $downloadResult = $downloader.Download()
-}
-catch {
-
-    Write-Failure `
-        "Download operation failed."
-
-    Write-Failure `
-        $_.Exception.Message
-
-    exit 20
-}
-
-$downloadSeconds = [math]::Round(
-    ((Get-Date) - $downloadStart).TotalSeconds,
-    1
-)
-
-Write-Success `
-    "Download operation completed."
-
-Write-Info `
-    "Download time: $downloadSeconds seconds"
-
-Write-Info `
-    "Result code: $($downloadResult.ResultCode)"
-
-# ============================================================
-# CHECK DOWNLOADS
-# ============================================================
-
-Write-Step "Checking downloaded updates..."
-
-$installCollection = `
-    New-Object -ComObject Microsoft.Update.UpdateColl
-
-$downloadFailures = 0
-
-foreach ($update in $updatesToInstall) {
-
-    if ($update.IsDownloaded) {
-
-        [void]$installCollection.Add($update)
-
-        Write-Success `
-            "Ready: $($update.Title)"
-    }
-    else {
-
-        Write-Failure `
-            "Download failed: $($update.Title)"
-
-        $downloadFailures++
-    }
-}
-
-Write-Host ""
-
-Write-Info `
-    "Ready to install: $($installCollection.Count)"
-
-Write-Info `
-    "Download failures: $downloadFailures"
-
-if ($installCollection.Count -eq 0) {
-
-    Write-Failure `
-        "No selected updates were successfully downloaded."
-
-    exit 21
-}
-
-# ============================================================
-# INSTALLATION SETUP
-# ============================================================
-
-Write-Step `
-    "Checking installation requirements..."
-
-$installer = $session.CreateUpdateInstaller()
-
-$installer.Updates = $installCollection
-
-try {
-
-    if ($installer.RebootRequiredBeforeInstallation) {
-
-        Write-WarningMessage `
-            "Windows requires a reboot before installation."
-
-        if ($Auto_Reboot) {
+            Write-Host ""
+            Write-Host ""
 
             Write-WarningMessage `
-                "Automatic reboot is enabled."
-
-            Write-WarningMessage `
-                "Restarting now..."
+                "Restarting computer..."
 
             Restart-Computer -Force
 
-            exit 3010
+            return $true
         }
 
-        Write-Failure `
-            "Installation cannot continue until Windows is restarted."
+        # ============================================================
+        # HEADER
+        # ============================================================
 
-        Write-WarningMessage `
-            "Restart Windows and run this script again."
+        Clear-Host
 
-        exit 3010
-    }
-}
-catch {
+        Write-Host ""
+        Write-Host "============================================================" `
+            -ForegroundColor Cyan
 
-    Write-WarningMessage `
-        "Could not determine pre-install reboot state."
+        Write-Host "                  WINDOWS UPDATE" `
+            -ForegroundColor Cyan
 
-    Write-WarningMessage `
-        "Continuing with installation."
-}
+        Write-Host "============================================================" `
+            -ForegroundColor Cyan
 
-# ============================================================
-# INSTALL
-# ============================================================
+        Write-Host ""
 
-Write-Step "Installing Windows Updates..."
+        Write-Info "Computer : $env:COMPUTERNAME"
+        Write-Info "Started  : $(Get-Date)"
 
-Write-Info `
-    "Updates to install: $($installCollection.Count)"
+        if ($Include_Optional) {
 
-Write-Info `
-    "This may take several minutes."
-
-$installStart = Get-Date
-
-try {
-
-    $installResult = $installer.Install()
-}
-catch {
-
-    Write-Failure `
-        "Windows Update installation failed."
-
-    Write-Failure `
-        $_.Exception.Message
-
-    exit 30
-}
-
-$installSeconds = [math]::Round(
-    ((Get-Date) - $installStart).TotalSeconds,
-    1
-)
-
-# ============================================================
-# INDIVIDUAL RESULTS
-# ============================================================
-
-Write-Step "Installation Results"
-
-$installedSuccessfully = 0
-$installedWithErrors = 0
-$failed = 0
-$unknown = 0
-
-for (
-    $i = 0;
-    $i -lt $installCollection.Count;
-    $i++
-) {
-
-    $update = $installCollection.Item($i)
-
-    $result = $installResult.GetUpdateResult($i)
-
-    Write-Host ""
-
-    Write-Host `
-        "  [$($i + 1)/$($installCollection.Count)]" `
-        -ForegroundColor Yellow
-
-    Write-Host `
-        "  $($update.Title)" `
-        -ForegroundColor White
-
-    Write-Info `
-        "Result code: $($result.ResultCode)"
-
-    Write-Info `
-        "HRESULT:     $($result.HResult)"
-
-    switch ([int]$result.ResultCode) {
-
-        # 2 = Succeeded
-        2 {
-
-            Write-Success `
-                "Installed successfully."
-
-            $installedSuccessfully++
+            Write-Info "Optional : Included"
         }
+        else {
 
-        # 3 = Succeeded with errors
-        3 {
-
-            Write-WarningMessage `
-                "Installed with errors."
-
-            $installedWithErrors++
+            Write-Info "Optional : Not selected"
         }
-
-        # 4 = Failed
-        4 {
-
-            Write-Failure `
-                "Installation failed."
-
-            $failed++
-        }
-
-        # 5 = Aborted
-        5 {
-
-            Write-Failure `
-                "Installation aborted."
-
-            $failed++
-        }
-
-        default {
-
-            Write-WarningMessage `
-                "Unknown installation result."
-
-            $unknown++
-        }
-    }
-}
-
-# ============================================================
-# REBOOT STATUS
-# ============================================================
-
-Write-Step "Checking final reboot status..."
-
-$rebootRequired = $false
-
-try {
-
-    $rebootRequired = `
-        [bool]$installResult.RebootRequired
-}
-catch {
-
-    $rebootRequired = Test-PendingReboot
-}
-
-# Check system state as a fallback.
-
-if (-not $rebootRequired) {
-
-    $rebootRequired = Test-PendingReboot
-}
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-Write-Host ""
-
-Write-Host `
-    "============================================================" `
-    -ForegroundColor Cyan
-
-Write-Host `
-    "                    UPDATE SUMMARY" `
-    -ForegroundColor Cyan
-
-Write-Host `
-    "============================================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
-
-Write-Info `
-    "Installation time     : $installSeconds seconds"
-
-Write-Info `
-    "Installed successfully: $installedSuccessfully"
-
-Write-Info `
-    "Installed with errors : $installedWithErrors"
-
-Write-Info `
-    "Failed                : $failed"
-
-Write-Info `
-    "Unknown               : $unknown"
-
-Write-Info `
-    "Download failures     : $downloadFailures"
-
-if ($existingPendingReboot) {
-
-    Write-Host ""
-
-    Write-WarningMessage `
-        "A reboot was already pending before this script ran."
-}
-
-if ($rebootRequired) {
-
-    Write-Host ""
-
-    Write-Host `
-        "    *** REBOOT REQUIRED ***" `
-        -ForegroundColor Yellow
-
-    Write-WarningMessage `
-        "Windows must restart to finish applying updates."
-}
-else {
-
-    Write-Host ""
-
-    Write-Success `
-        "No reboot is required."
-}
-
-# ============================================================
-# FAILURE HANDLING
-# ============================================================
-
-if (
-    $failed -gt 0 -or
-    $downloadFailures -gt 0 -or
-    $unknown -gt 0
-) {
-
-    Write-Host ""
-
-    Write-Failure `
-        "Windows Update completed with errors."
-
-    if ($installedWithErrors -gt 0) {
-
-        Write-WarningMessage `
-            "$installedWithErrors update(s) installed with errors."
-    }
-
-    if ($rebootRequired -and $Auto_Reboot) {
-
-        Start-UpdateReboot | Out-Null
-    }
-
-    exit 40
-}
-
-# ============================================================
-# INSTALLATION-WITH-ERRORS HANDLING
-# ============================================================
-
-if ($installedWithErrors -gt 0) {
-
-    Write-Host ""
-
-    Write-WarningMessage `
-        "All selected updates completed, but one or more reported errors."
-
-    if ($rebootRequired) {
 
         if ($Auto_Reboot) {
 
-            Start-UpdateReboot | Out-Null
+            Write-Info "Reboot   : Automatic when required"
+        }
+        else {
+
+            Write-Info "Reboot   : Manual"
+        }
+
+        Write-Info "Elevated : Administrator"
+
+        # ============================================================
+        # ADMIN CHECK
+        # ============================================================
+        #
+        # This is a safety check only.
+        #
+        # The actual elevation occurred at the beginning of the script.
+        # If this check fails, something unexpected happened.
+        # ============================================================
+
+        Write-Step "Verifying administrator privileges..."
+
+        if (-not (Test-IsAdministrator)) {
+
+            Write-Failure `
+                "Administrator privileges were not detected."
+
+            Write-Failure `
+                "Windows Update cannot continue."
+
+            exit 1
+        }
+
+        Write-Success `
+            "Administrator privileges confirmed."
+
+        # ============================================================
+        # EXISTING REBOOT CHECK
+        # ============================================================
+
+        Write-Step "Checking for a pending reboot..."
+
+        $existingPendingReboot = Test-PendingReboot
+
+        if ($existingPendingReboot) {
+
+            Write-WarningMessage `
+                "Windows currently reports a pending reboot."
+
+            Write-WarningMessage `
+                "The script will not automatically reboot at this stage."
+
+            if ($Auto_Reboot) {
+
+                Write-Info `
+                    "Automatic reboot will only occur if the current update operation requires it."
+            }
+        }
+        else {
+
+            Write-Success `
+                "No pending reboot detected."
+        }
+
+        # ============================================================
+        # WINDOWS UPDATE SESSION
+        # ============================================================
+
+        Write-Step "Connecting to Windows Update..."
+
+        try {
+
+            $session = New-Object -ComObject Microsoft.Update.Session
+
+            $session.ClientApplicationID = `
+                "PowerShell Windows Updater"
+
+            $searcher = $session.CreateUpdateSearcher()
+
+            $searcher.Online = $true
+        }
+        catch {
+
+            Write-Failure `
+                "Could not initialize Windows Update."
+
+            Write-Failure `
+                $_.Exception.Message
+
+            exit 2
+        }
+
+        Write-Success `
+            "Windows Update Agent initialized."
+
+        # ============================================================
+        # SEARCH
+        # ============================================================
+
+        Write-Step "Searching Windows Update..."
+
+        Write-Info "Online search: enabled"
+        Write-Info "Hidden updates included: $Include_Hidden"
+        Write-Info "Installed updates: excluded"
+
+        Write-Host ""
+
+        $searchStart = Get-Date
+
+        try {
+
+            $searchResult = $searcher.Search(
+                $(if ($Include_Hidden) { "(IsInstalled=0 and IsHidden=0) or (IsInstalled=0 and IsHidden=1)" } else { "IsInstalled=0 and IsHidden=0" })
+            )
+        }
+        catch {
+
+            Write-Failure `
+                "Windows Update search failed."
+
+            Write-Failure `
+                $_.Exception.Message
+
+            exit 3
+        }
+
+        $searchSeconds = [math]::Round(
+            ((Get-Date) - $searchStart).TotalSeconds,
+            1
+        )
+
+        $allUpdates = $searchResult.Updates
+
+        Write-Success `
+            "Search completed."
+
+        Write-Info `
+            "Search time: $searchSeconds seconds"
+
+        Write-Info `
+            "Updates found: $($allUpdates.Count)"
+
+        # ============================================================
+        # CATEGORIZE UPDATES
+        # ============================================================
+
+        Write-Step "Categorizing updates..."
+
+        $requiredUpdates = `
+            New-Object -ComObject Microsoft.Update.UpdateColl
+
+        $optionalUpdates = `
+            New-Object -ComObject Microsoft.Update.UpdateColl
+
+        $driverUpdates = `
+            New-Object -ComObject Microsoft.Update.UpdateColl
+
+        foreach ($update in $allUpdates) {
+
+            $type = Get-UpdateType $update
+
+            switch ($type) {
+
+                "Driver" {
+
+                    [void]$driverUpdates.Add($update)
+                }
+
+                "Optional" {
+
+                    [void]$optionalUpdates.Add($update)
+                }
+
+                default {
+
+                    [void]$requiredUpdates.Add($update)
+                }
+            }
+        }
+
+        Write-Success `
+            "Categorization complete."
+
+        # ============================================================
+        # DISPLAY REQUIRED
+        # ============================================================
+
+        Write-Host ""
+        Write-Host "WINDOWS UPDATE" -ForegroundColor White
+
+        Write-Host "------------------------------------------------------------" `
+            -ForegroundColor DarkGray
+
+        Write-Host ""
+        Write-Host "Required Updates" -ForegroundColor Cyan
+
+        if ($requiredUpdates.Count -eq 0) {
+
+            Write-Host "  None" -ForegroundColor DarkGray
+        }
+        else {
+
+            for (
+                $i = 0;
+                $i -lt $requiredUpdates.Count;
+                $i++
+            ) {
+
+                $update = $requiredUpdates.Item($i)
+
+                Write-UpdateEntry $update
+            }
+        }
+
+        # ============================================================
+        # DISPLAY OPTIONAL
+        # ============================================================
+
+        Write-Host ""
+        Write-Host "Optional Updates" -ForegroundColor Cyan
+
+        if ($optionalUpdates.Count -eq 0) {
+
+            Write-Host "  None" -ForegroundColor DarkGray
+        }
+        else {
+
+            for (
+                $i = 0;
+                $i -lt $optionalUpdates.Count;
+                $i++
+            ) {
+
+                $update = $optionalUpdates.Item($i)
+
+                Write-UpdateEntry $update
+            }
+        }
+
+        # ============================================================
+        # DISPLAY DRIVERS
+        # ============================================================
+
+        Write-Host ""
+        Write-Host "Drivers" -ForegroundColor Cyan
+
+        if ($driverUpdates.Count -eq 0) {
+
+            Write-Host "  None" -ForegroundColor DarkGray
+        }
+        else {
+
+            for (
+                $i = 0;
+                $i -lt $driverUpdates.Count;
+                $i++
+            ) {
+
+                $update = $driverUpdates.Item($i)
+
+                Write-UpdateEntry $update
+            }
+        }
+
+        # ============================================================
+        # SUMMARY
+        # ============================================================
+
+        Write-Host ""
+        Write-Host "Available Updates:" -ForegroundColor Cyan
+
+        Write-Host "  Required:         $($requiredUpdates.Count)"
+        Write-Host "  Optional:         $($optionalUpdates.Count)"
+        Write-Host "  Drivers:          $($driverUpdates.Count)"
+
+        # ============================================================
+        # NOTHING FOUND
+        # ============================================================
+
+        if (
+            $requiredUpdates.Count -eq 0 -and
+            $optionalUpdates.Count -eq 0 -and
+            $driverUpdates.Count -eq 0
+        ) {
+
+            Write-Host ""
+
+            Write-Host `
+                "============================================================" `
+                -ForegroundColor Green
+
+            Write-Host `
+                "                WINDOWS IS UP TO DATE" `
+                -ForegroundColor Green
+
+            Write-Host `
+                "============================================================" `
+                -ForegroundColor Green
+
+            Write-Host ""
+
+            exit 0
+        }
+
+        # ============================================================
+        # BUILD INSTALLATION LIST
+        # ============================================================
+
+        $updatesToInstall = `
+            New-Object -ComObject Microsoft.Update.UpdateColl
+
+        # Required updates are always selected.
+
+        foreach ($update in $requiredUpdates) {
+
+            if ($update.IsHidden) {
+                if ((Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+            }
+            [void]$updatesToInstall.Add($update)
+        }
+
+        # Optional updates and drivers require -Include_Optional.
+
+        if ($Include_Optional) {
+
+            foreach ($update in $optionalUpdates) {
+
+                if ($update.IsHidden) {
+                if ((Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+            }
+            [void]$updatesToInstall.Add($update)
+            }
+
+            foreach ($update in $driverUpdates) {
+
+                if ($update.IsHidden) {
+                if ((Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+            }
+            [void]$updatesToInstall.Add($update)
+            }
+        }
+
+        Write-Host ""
+
+        Write-Host `
+            "Selected for installation: $($updatesToInstall.Count)" `
+            -ForegroundColor Cyan
+
+        if (-not $Include_Optional) {
+
+            Write-Info `
+                "Optional updates and drivers are displayed but not selected."
+
+            Write-Info `
+                "Use -Include_Optional to install them."
+        }
+
+        # ============================================================
+        # NOTHING SELECTED
+        # ============================================================
+
+        if ($updatesToInstall.Count -eq 0) {
+
+            Write-Host ""
+
+            Write-WarningMessage `
+                "No updates are selected for installation."
+
+            Write-Info `
+                "Use -Include_Optional if you want to install optional updates and drivers."
+
+            exit 0
+        }
+
+        # ============================================================
+        # CONFIRMATION
+        # ============================================================
+
+        Write-Host ""
+
+        Write-Host `
+            "Install selected updates? [Y/N] " `
+            -NoNewline `
+            -ForegroundColor Yellow
+
+        $answer = Read-Host
+
+        if ($answer -notmatch "^[Yy]$") {
+
+            Write-Host ""
+
+            Write-WarningMessage `
+                "Installation cancelled by user."
+
+            exit 10
+        }
+
+        # ============================================================
+        # DOWNLOAD PREPARATION
+        # ============================================================
+
+        Write-Step "Preparing updates..."
+
+        # Unhide only confirmed, selected updates immediately before downloading.
+        foreach ($update in $updatesToInstall) {
+            if ($update.IsHidden) { $update.IsHidden = $false }
+            if (-not $update.EulaAccepted) { $update.AcceptEula() }
+        }
+
+        $updatesNeedingEula = 0
+
+        foreach ($update in $updatesToInstall) {
+
+            try {
+
+                if (-not $update.EulaAccepted) {
+
+                    Write-WarningMessage `
+                        "EULA not yet accepted:"
+
+                    Write-Info `
+                        $update.Title
+
+                    Write-Info `
+                        "Windows Update will handle EULA requirements during installation."
+
+                    $updatesNeedingEula++
+                }
+            }
+            catch {
+                # Some updates may not expose EulaAccepted.
+            }
+        }
+
+        if ($updatesNeedingEula -gt 0) {
+
+            Write-Info `
+                "$updatesNeedingEula update(s) report an unaccepted EULA."
+        }
+
+        Write-Success `
+            "Updates prepared."
+
+        # ============================================================
+        # DOWNLOAD
+        # ============================================================
+
+        Write-Step "Downloading updates..."
+
+        Write-Info `
+            "Updates selected: $($updatesToInstall.Count)"
+
+        Write-Info `
+            "Windows Update is downloading the required files."
+
+        $downloader = $session.CreateUpdateDownloader()
+
+        $downloader.Updates = $updatesToInstall
+
+        $downloadStart = Get-Date
+
+        try {
+
+            $downloadResult = $downloader.Download()
+        }
+        catch {
+
+            Write-Failure `
+                "Download operation failed."
+
+            Write-Failure `
+                $_.Exception.Message
+
+            exit 20
+        }
+
+        $downloadSeconds = [math]::Round(
+            ((Get-Date) - $downloadStart).TotalSeconds,
+            1
+        )
+
+        Write-Success `
+            "Download operation completed."
+
+        Write-Info `
+            "Download time: $downloadSeconds seconds"
+
+        Write-Info `
+            "Result code: $($downloadResult.ResultCode)"
+
+        # ============================================================
+        # CHECK DOWNLOADS
+        # ============================================================
+
+        Write-Step "Checking downloaded updates..."
+
+        $installCollection = `
+            New-Object -ComObject Microsoft.Update.UpdateColl
+
+        $downloadFailures = 0
+
+        foreach ($update in $updatesToInstall) {
+
+            if ($update.IsDownloaded) {
+
+                [void]$installCollection.Add($update)
+
+                Write-Success `
+                    "Ready: $($update.Title)"
+            }
+            else {
+
+                Write-Failure `
+                    "Download failed: $($update.Title)"
+
+                $downloadFailures++
+            }
+        }
+
+        Write-Host ""
+
+        Write-Info `
+            "Ready to install: $($installCollection.Count)"
+
+        Write-Info `
+            "Download failures: $downloadFailures"
+
+        if ($installCollection.Count -eq 0) {
+
+            Write-Failure `
+                "No selected updates were successfully downloaded."
+
+            exit 21
+        }
+
+        # ============================================================
+        # INSTALLATION SETUP
+        # ============================================================
+
+        Write-Step `
+            "Checking installation requirements..."
+
+        $installer = $session.CreateUpdateInstaller()
+
+        $installer.Updates = $installCollection
+
+        try {
+
+            if ($installer.RebootRequiredBeforeInstallation) {
+
+                Write-WarningMessage `
+                    "Windows requires a reboot before installation."
+
+                if ($Auto_Reboot) {
+
+                    Write-WarningMessage `
+                        "Automatic reboot is enabled."
+
+                    Write-WarningMessage `
+                        "Restarting now..."
+
+                    Restart-Computer -Force
+
+                    exit 3010
+                }
+
+                Write-Failure `
+                    "Installation cannot continue until Windows is restarted."
+
+                Write-WarningMessage `
+                    "Restart Windows and run this script again."
+
+                exit 3010
+            }
+        }
+        catch {
+
+            Write-WarningMessage `
+                "Could not determine pre-install reboot state."
+
+            Write-WarningMessage `
+                "Continuing with installation."
+        }
+
+        # ============================================================
+        # INSTALL
+        # ============================================================
+
+        Write-Step "Installing Windows Updates..."
+
+        Write-Info `
+            "Updates to install: $($installCollection.Count)"
+
+        Write-Info `
+            "This may take several minutes."
+
+        $installStart = Get-Date
+
+        try {
+
+            $installResult = $installer.Install()
+        }
+        catch {
+
+            Write-Failure `
+                "Windows Update installation failed."
+
+            Write-Failure `
+                $_.Exception.Message
+
+            exit 30
+        }
+
+        $installSeconds = [math]::Round(
+            ((Get-Date) - $installStart).TotalSeconds,
+            1
+        )
+
+        # ============================================================
+        # INDIVIDUAL RESULTS
+        # ============================================================
+
+        Write-Step "Installation Results"
+
+        $installedSuccessfully = 0
+        $installedWithErrors = 0
+        $failed = 0
+        $unknown = 0
+
+        for (
+            $i = 0;
+            $i -lt $installCollection.Count;
+            $i++
+        ) {
+
+            $update = $installCollection.Item($i)
+
+            $result = $installResult.GetUpdateResult($i)
+
+            Write-Host ""
+
+            Write-Host `
+                "  [$($i + 1)/$($installCollection.Count)]" `
+                -ForegroundColor Yellow
+
+            Write-Host `
+                "  $($update.Title)" `
+                -ForegroundColor White
+
+            Write-Info `
+                "Result code: $($result.ResultCode)"
+
+            Write-Info `
+                "HRESULT:     $($result.HResult)"
+
+            switch ([int]$result.ResultCode) {
+
+                # 2 = Succeeded
+                2 {
+
+                    Write-Success `
+                        "Installed successfully."
+
+                    $installedSuccessfully++
+                }
+
+                # 3 = Succeeded with errors
+                3 {
+
+                    Write-WarningMessage `
+                        "Installed with errors."
+
+                    $installedWithErrors++
+                }
+
+                # 4 = Failed
+                4 {
+
+                    Write-Failure `
+                        "Installation failed."
+
+                    $failed++
+                }
+
+                # 5 = Aborted
+                5 {
+
+                    Write-Failure `
+                        "Installation aborted."
+
+                    $failed++
+                }
+
+                default {
+
+                    Write-WarningMessage `
+                        "Unknown installation result."
+
+                    $unknown++
+                }
+            }
+        }
+
+        # ============================================================
+        # REBOOT STATUS
+        # ============================================================
+
+        Write-Step "Checking final reboot status..."
+
+        $rebootRequired = $false
+
+        try {
+
+            $rebootRequired = `
+                [bool]$installResult.RebootRequired
+        }
+        catch {
+
+            $rebootRequired = Test-PendingReboot
+        }
+
+        # Check system state as a fallback.
+
+        if (-not $rebootRequired) {
+
+            $rebootRequired = Test-PendingReboot
+        }
+
+        # ============================================================
+        # FINAL SUMMARY
+        # ============================================================
+
+        Write-Host ""
+
+        Write-Host `
+            "============================================================" `
+            -ForegroundColor Cyan
+
+        Write-Host `
+            "                    UPDATE SUMMARY" `
+            -ForegroundColor Cyan
+
+        Write-Host `
+            "============================================================" `
+            -ForegroundColor Cyan
+
+        Write-Host ""
+
+        Write-Info `
+            "Installation time     : $installSeconds seconds"
+
+        Write-Info `
+            "Installed successfully: $installedSuccessfully"
+
+        Write-Info `
+            "Installed with errors : $installedWithErrors"
+
+        Write-Info `
+            "Failed                : $failed"
+
+        Write-Info `
+            "Unknown               : $unknown"
+
+        Write-Info `
+            "Download failures     : $downloadFailures"
+
+        if ($existingPendingReboot) {
+
+            Write-Host ""
+
+            Write-WarningMessage `
+                "A reboot was already pending before this script ran."
+        }
+
+        if ($rebootRequired) {
+
+            Write-Host ""
+
+            Write-Host `
+                "    *** REBOOT REQUIRED ***" `
+                -ForegroundColor Yellow
+
+            Write-WarningMessage `
+                "Windows must restart to finish applying updates."
+        }
+        else {
+
+            Write-Host ""
+
+            Write-Success `
+                "No reboot is required."
+        }
+
+        # ============================================================
+        # FAILURE HANDLING
+        # ============================================================
+
+        if (
+            $failed -gt 0 -or
+            $downloadFailures -gt 0 -or
+            $unknown -gt 0
+        ) {
+
+            Write-Host ""
+
+            Write-Failure `
+                "Windows Update completed with errors."
+
+            if ($installedWithErrors -gt 0) {
+
+                Write-WarningMessage `
+                    "$installedWithErrors update(s) installed with errors."
+            }
+
+            if ($rebootRequired -and $Auto_Reboot) {
+
+                Start-UpdateReboot | Out-Null
+            }
+
+            exit 40
+        }
+
+        # ============================================================
+        # INSTALLATION-WITH-ERRORS HANDLING
+        # ============================================================
+
+        if ($installedWithErrors -gt 0) {
+
+            Write-Host ""
+
+            Write-WarningMessage `
+                "All selected updates completed, but one or more reported errors."
+
+            if ($rebootRequired) {
+
+                if ($Auto_Reboot) {
+
+                    Start-UpdateReboot | Out-Null
+
+                    exit 3010
+                }
+
+                Write-WarningMessage `
+                    "Automatic reboot is disabled."
+
+                Write-WarningMessage `
+                    "Restart Windows manually when convenient."
+
+                exit 3010
+            }
+
+            exit 40
+        }
+
+        # ============================================================
+        # REBOOT HANDLING
+        # ============================================================
+
+        if ($rebootRequired) {
+
+            if ($Auto_Reboot) {
+
+                Start-UpdateReboot | Out-Null
+
+                exit 3010
+            }
+
+            Write-Host ""
+
+            Write-WarningMessage `
+                "Automatic reboot is disabled."
+
+            Write-WarningMessage `
+                "Restart Windows manually when convenient."
 
             exit 3010
         }
 
-        Write-WarningMessage `
-            "Automatic reboot is disabled."
+        # ============================================================
+        # SUCCESS
+        # ============================================================
 
-        Write-WarningMessage `
-            "Restart Windows manually when convenient."
+        Write-Host ""
 
-        exit 3010
+        Write-Host `
+            "============================================================" `
+            -ForegroundColor Green
+
+        Write-Host `
+            "              WINDOWS UPDATE COMPLETE" `
+            -ForegroundColor Green
+
+        Write-Host `
+            "============================================================" `
+            -ForegroundColor Green
+
+        Write-Host ""
+
+        Write-Success `
+            "All selected updates completed successfully."
+
+        exit 0
     }
 
-    exit 40
-}
+    if ($Mode -eq 'Windows') {
+        Invoke-WindowsUpdate -Include_Optional:$Optional -Include_Hidden:$Hidden -Auto_Reboot:$Reboot
+        return
+    }
+    if ($Mode -eq 'Run') {
+        $ErrorActionPreference = 'Stop'
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator access is required.' }
+        $argsWU = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath, '-Mode', 'Windows')
+            if ($Optional) { $argsWU += '-Optional' }
+            if ($Hidden) { $argsWU += '-Hidden' }
+            if ($Reboot -and -not $Lenovo) { $argsWU += '-Reboot' }
+            & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @argsWU
+            $windowsExit = $LASTEXITCODE
+            Write-Host "Windows Update exit code: $windowsExit"
+            if ($Lenovo) {
+                if ((Get-CimInstance Win32_ComputerSystem).Manufacturer -notmatch 'Lenovo') {
+                    Write-Warning 'Lenovo updates skipped: this computer is not identified as Lenovo.'
+                } else {
+                    $helper = Join-Path $env:ProgramFiles 'Lenovo\SUHelper\suhelper.exe'
+                    if (-not (Test-Path -LiteralPath $helper)) {
+                        Write-Warning 'Install Lenovo Commercial Vantage and SU Helper, then rerun this menu.'
+                        Write-Host 'https://docs.lenovocdrt.com/guides/lcv/suhelper/'
+                    } elseif ((Read-Host 'Start Lenovo update installation now? [y/N]') -match '^[Yy]$') {
+                        $types = '2'
+                        if ($Firmware) { $types = '2,3,4' }
+                        & $helper -autoupdate -packagetype $types -reboottype '0,3,5' -noreboot
+                        $helperExit = $LASTEXITCODE
+                        if ($helperExit -eq 0) {
+                            Write-Host 'Lenovo update session requested. Installation continues through Commercial Vantage.'
+                            Write-Host 'Check Vantage for completion and results before restarting.'
+                        } else { Write-Warning "Lenovo SU Helper returned $helperExit (1=parameters, 2=busy, 3=error)." }
+                    }
+                }
+            }
 
-# ============================================================
-# REBOOT HANDLING
-# ============================================================
-
-if ($rebootRequired) {
-
-    if ($Auto_Reboot) {
-
-        Start-UpdateReboot | Out-Null
-
-        exit 3010
+        [void](Read-Host 'Press Enter to close')
+        return
+    }
+    $ErrorActionPreference = 'Stop'
+    function Read-Choice([string]$Prompt) {
+        while ($true) {
+            $answer = Read-Host "$Prompt [y/N]"
+            if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^[Nn]$') { return $false }
+            if ($answer -match '^[Yy]$') { return $true }
+            Write-Host 'Enter Y or N.'
+        }
+    }
+    $optional = $false; $hidden = $false; $lenovo = $false; $firmware = $false; $reboot = $false
+    while ($true) {
+        Clear-Host
+        Write-Host 'windate - update options' -ForegroundColor Cyan
+        Write-Host 'Required Windows updates are always included.'
+        Write-Host "[1] Optional Windows updates and drivers: $optional"
+        Write-Host "[2] Hidden Windows updates (individual review): $hidden"
+        Write-Host "[3] Lenovo drivers via Commercial Vantage: $lenovo"
+        Write-Host "[4] Lenovo BIOS and firmware: $firmware"
+        Write-Host "[5] Automatic Windows restart: $reboot"
+        Write-Host '[S] Start    [Q] Quit'
+        $choice = (Read-Host 'Choose an option').Trim().ToUpperInvariant()
+        switch ($choice) {
+            '1' { $optional = -not $optional }
+            '2' { $hidden = -not $hidden }
+            '3' { $lenovo = -not $lenovo; if (-not $lenovo) { $firmware = $false } }
+            '4' {
+                if ($firmware) { $firmware = $false }
+                elseif (Read-Choice 'Include Lenovo BIOS/firmware updates? Connect AC power first.') { $firmware = $true; $lenovo = $true }
+            }
+            '5' { $reboot = -not $reboot }
+            'Q' { return }
+            'S' { break }
+            default { continue }
+        }
+        if ($choice -eq 'S') { break }
+    }
+    if ($lenovo -and $reboot) {
+        Write-Host 'Automatic restart disabled for this run so Lenovo updates can finish.'
+        $reboot = $false
     }
 
-    Write-Host ""
-
-    Write-WarningMessage `
-        "Automatic reboot is disabled."
-
-    Write-WarningMessage `
-        "Restart Windows manually when convenient."
-
-    exit 3010
+    # Preserve this complete, readable script when invoked through irm | iex.
+    $definition = (Get-Command Invoke-Windate -CommandType Function).Definition
+    $entry = @'
+param(
+    [ValidateSet('Menu','Run','Windows')][string]$Mode = 'Menu',
+    [switch]$Optional, [switch]$Hidden, [switch]$Lenovo,
+    [switch]$Firmware, [switch]$Reboot
+)
+'@
+    $scriptText = $entry + "`r`nfunction Invoke-Windate {`r`n" + $definition + "`r`n}`r`nInvoke-Windate @PSBoundParameters`r`n"
+    $runnerPath = Join-Path $env:TEMP ('windate-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    [IO.File]::WriteAllText($runnerPath, $scriptText, (New-Object Text.UTF8Encoding($true)))
+    $launchArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File', ('"' + $runnerPath + '"'), '-Mode', 'Run')
+    if ($optional) { $launchArgs += '-Optional' }
+    if ($hidden) { $launchArgs += '-Hidden' }
+    if ($lenovo) { $launchArgs += '-Lenovo' }
+    if ($firmware) { $launchArgs += '-Firmware' }
+    if ($reboot) { $launchArgs += '-Reboot' }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    try {
+        $processOptions = @{
+            FilePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ArgumentList = $launchArgs
+            Wait = $true
+            PassThru = $true
+        }
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { $processOptions.Verb = 'RunAs' }
+        $process = Start-Process @processOptions
+        Write-Host "windate process finished with exit code $($process.ExitCode)."
+    } catch { Write-Warning "windate could not start: $($_.Exception.Message)" }
+    finally { Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue }
 }
-
-# ============================================================
-# SUCCESS
-# ============================================================
-
-Write-Host ""
-
-Write-Host `
-    "============================================================" `
-    -ForegroundColor Green
-
-Write-Host `
-    "              WINDOWS UPDATE COMPLETE" `
-    -ForegroundColor Green
-
-Write-Host `
-    "============================================================" `
-    -ForegroundColor Green
-
-Write-Host ""
-
-Write-Success `
-    "All selected updates completed successfully."
-
-exit 0
+Invoke-Windate @PSBoundParameters
