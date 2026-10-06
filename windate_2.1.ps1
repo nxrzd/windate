@@ -5,7 +5,7 @@
 .DESCRIPTION
     One readable script for local execution or irm <hosted HTTPS URL> | iex.
     Optional Windows updates, hidden updates, Lenovo drivers, BIOS/firmware,
-    and automatic Windows restart are configured before scanning starts.
+    hardware driver installation, and automatic Windows restart are configured before scanning starts.
     Lenovo requires Commercial Vantage and SU Helper. Firmware is opt-in.
     Internal worker modes isolate Windows Update exit codes from the menu.
 #>
@@ -13,7 +13,7 @@
 param(
     [ValidateSet('Menu','Run','Windows')][string]$Mode = 'Menu',
     [switch]$Optional, [switch]$Hidden, [switch]$Lenovo,
-    [switch]$Firmware, [switch]$Reboot
+    [switch]$Firmware, [switch]$Hardware, [switch]$Reboot
 )
 
 function Invoke-Windate {
@@ -24,6 +24,7 @@ function Invoke-Windate {
         [switch]$Hidden,
         [switch]$Lenovo,
         [switch]$Firmware,
+        [switch]$Hardware,
         [switch]$Reboot
     )
 
@@ -93,6 +94,7 @@ function Invoke-Windate {
             [switch]$Include_Optional,
 
             [switch]$Include_Hidden,
+            [switch]$Hardware_Drivers,
             [switch]$Auto_Reboot
         )
 
@@ -565,6 +567,25 @@ function Invoke-Windate {
         )
 
         $allUpdates = $searchResult.Updates
+        # Record exactly what the API offered for feature-update troubleshooting.
+        try {
+            $reportDir = Join-Path $env:ProgramData 'windate'
+            New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+            $offerReport = @($allUpdates | ForEach-Object {
+                [pscustomobject]@{
+                    Title = $_.Title
+                    UpdateID = $_.Identity.UpdateID
+                    Hidden = $_.IsHidden
+                    Optional = $_.BrowseOnly
+                    Type = $_.Type
+                }
+            })
+            ConvertTo-Json -InputObject $offerReport -Depth 4 | Set-Content -LiteralPath (Join-Path $reportDir 'last-update-scan.json') -Encoding UTF8
+            Write-Info "Scan report: $reportDir\last-update-scan.json"
+        } catch { Write-WarningMessage "Could not save scan report: $($_.Exception.Message)" }
+        Write-Info 'All offered software updates are selected when option 1 is enabled, including feature updates returned by this API.'
+        Write-WarningMessage 'A feature upgrade shown only in Settings may not be returned by this API. This scan does not prove Settings has no additional upgrade.'
+
 
         Write-Success `
             "Search completed."
@@ -754,24 +775,17 @@ function Invoke-Windate {
             [void]$updatesToInstall.Add($update)
         }
 
-        # Optional updates and drivers require -Include_Optional.
-
+        # Optional software and applicable device drivers can be selected independently.
         if ($Include_Optional) {
-
             foreach ($update in $optionalUpdates) {
-
-                if ($update.IsHidden) {
-                if ((Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+                if ($update.IsHidden -and (Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+                [void]$updatesToInstall.Add($update)
             }
-            [void]$updatesToInstall.Add($update)
-            }
-
+        }
+        if ($Include_Optional -or $Hardware_Drivers) {
             foreach ($update in $driverUpdates) {
-
-                if ($update.IsHidden) {
-                if ((Read-Host "Include hidden update '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
-            }
-            [void]$updatesToInstall.Add($update)
+                if ($update.IsHidden -and (Read-Host "Include hidden driver '$($update.Title)'? [y/N]") -notmatch '^[Yy]$') { continue }
+                [void]$updatesToInstall.Add($update)
             }
         }
 
@@ -784,7 +798,7 @@ function Invoke-Windate {
         if (-not $Include_Optional) {
 
             Write-Info `
-                "Optional updates and drivers are displayed but not selected."
+                "Optional software is not selected. Hardware driver selection: $Hardware_Drivers"
 
             Write-Info `
                 "Use -Include_Optional to install them."
@@ -1338,7 +1352,7 @@ function Invoke-Windate {
     }
 
     if ($Mode -eq 'Windows') {
-        Invoke-WindowsUpdate -Include_Optional:$Optional -Include_Hidden:$Hidden -Auto_Reboot:$Reboot
+        Invoke-WindowsUpdate -Include_Optional:$Optional -Include_Hidden:$Hidden -Auto_Reboot:$Reboot -Hardware_Drivers:$Hardware
         return
     }
     if ($Mode -eq 'Run') {
@@ -1346,13 +1360,71 @@ function Invoke-Windate {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
         $principal = New-Object Security.Principal.WindowsPrincipal($identity)
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator access is required.' }
+        Write-Host 'Detected hardware' -ForegroundColor Cyan
+        $computer = Get-CimInstance Win32_ComputerSystem
+        $processors = @(Get-CimInstance Win32_Processor)
+        $graphics = @(Get-CimInstance Win32_VideoController)
+        $os = Get-CimInstance Win32_OperatingSystem
+        Write-Host "Computer: $($computer.Manufacturer) $($computer.Model)"
+        Write-Host "Windows architecture: $($os.OSArchitecture)"
+        foreach ($cpu in $processors) {
+            $architecture = switch ([int]$cpu.Architecture) { 0 {'x86'} 9 {'x64'} 12 {'ARM64'} default {"Code $($cpu.Architecture)"} }
+            Write-Host "CPU: $($cpu.Name) | $architecture"
+        }
+        foreach ($gpu in $graphics) {
+            $vendor = switch -Regex ($gpu.PNPDeviceID) {
+                'VEN_8086' {'Intel'; break}
+                'VEN_1002' {'AMD'; break}
+                'VEN_10DE' {'NVIDIA'; break}
+                default {$gpu.AdapterCompatibility}
+            }
+            Write-Host "GPU: $($gpu.Name) | $vendor | Driver $($gpu.DriverVersion)"
+            Write-Host "  Device ID: $($gpu.PNPDeviceID)"
+        }
+        if ($Hardware) {
+            Write-Host 'Windows Update will select drivers applicable to this hardware and operating system.'
+            Write-Host 'Includes available graphics, chipset, network, and other device drivers.'
+            Write-Host 'The configured update service may not offer the newest vendor website releases.'
+        }
         $argsWU = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath, '-Mode', 'Windows')
             if ($Optional) { $argsWU += '-Optional' }
             if ($Hidden) { $argsWU += '-Hidden' }
+            if ($Hardware) { $argsWU += '-Hardware' }
             if ($Reboot -and -not $Lenovo) { $argsWU += '-Reboot' }
             & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @argsWU
             $windowsExit = $LASTEXITCODE
             Write-Host "Windows Update exit code: $windowsExit"
+            $restartRequired = ($windowsExit -eq 3010)
+            try {
+                $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+                $restartRequired = $restartRequired -or [bool]$systemInfo.RebootRequired
+            } catch { Write-Warning 'Could not read Windows Update restart status.' }
+            foreach ($key in @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+            )) { if (Test-Path $key) { $restartRequired = $true } }
+            if ($restartRequired) {
+                Write-Host 'RESTART REQUIRED: save your work and restart Windows to finish updating.' -ForegroundColor Yellow
+                try {
+                    Add-Type -AssemblyName System.Windows.Forms
+                    Add-Type -AssemblyName System.Drawing
+                    $notification = New-Object System.Windows.Forms.NotifyIcon
+                    try {
+                        $notification.Icon = [System.Drawing.SystemIcons]::Information
+                        $notification.Visible = $true
+                        $notification.BalloonTipTitle = 'windate: restart required'
+                        $notification.BalloonTipText = 'Save your work and restart Windows to finish applying updates.'
+                        $notification.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+                        $notification.ShowBalloonTip(10000)
+                        # Keep the notification icon alive while Windows displays the balloon.
+                        for ($tick = 0; $tick -lt 100; $tick++) {
+                            [System.Windows.Forms.Application]::DoEvents()
+                            Start-Sleep -Milliseconds 100
+                        }
+                    } finally { $notification.Dispose() }
+                } catch { Write-Warning 'Desktop notification unavailable; restart requirement is shown above.' }
+            }
+
             if ($Lenovo) {
                 if ((Get-CimInstance Win32_ComputerSystem).Manufacturer -notmatch 'Lenovo') {
                     Write-Warning 'Lenovo updates skipped: this computer is not identified as Lenovo.'
@@ -1386,17 +1458,18 @@ function Invoke-Windate {
             Write-Host 'Enter Y or N.'
         }
     }
-    $optional = $false; $hidden = $false; $lenovo = $false; $firmware = $false; $reboot = $false
+    $optional = $true; $hidden = $false; $lenovo = $false; $firmware = $false; $hardware = $true; $reboot = $false
     while ($true) {
         Clear-Host
         Write-Host 'windate - update options' -ForegroundColor Cyan
-        Write-Host 'Required Windows updates are always included.'
+        Write-Host 'All offered Windows software and hardware updates are selected by default.'
         Write-Host "[1] Optional Windows updates and drivers: $optional"
         Write-Host "[2] Hidden Windows updates (individual review): $hidden"
         Write-Host "[3] Lenovo drivers via Commercial Vantage: $lenovo"
         Write-Host "[4] Lenovo BIOS and firmware: $firmware"
         Write-Host "[5] Automatic Windows restart: $reboot"
-        Write-Host '[S] Start    [Q] Quit'
+        Write-Host "[6] Automatic hardware drivers (Intel / AMD / NVIDIA): $hardware"
+        Write-Host '[S] Start    [Q] Quit' 
         $choice = (Read-Host 'Choose an option').Trim().ToUpperInvariant()
         switch ($choice) {
             '1' { $optional = -not $optional }
@@ -1407,6 +1480,7 @@ function Invoke-Windate {
                 elseif (Read-Choice 'Include Lenovo BIOS/firmware updates? Connect AC power first.') { $firmware = $true; $lenovo = $true }
             }
             '5' { $reboot = -not $reboot }
+            '6' { $hardware = -not $hardware }
             'Q' { return }
             'S' { break }
             default { continue }
@@ -1414,7 +1488,7 @@ function Invoke-Windate {
         if ($choice -eq 'S') { break }
     }
     if ($lenovo -and $reboot) {
-        Write-Host 'Automatic restart disabled for this run so Lenovo updates can finish.'
+        Write-Host 'Automatic restart disabled for this run so vendor updates can finish.'
         $reboot = $false
     }
 
@@ -1424,7 +1498,7 @@ function Invoke-Windate {
 param(
     [ValidateSet('Menu','Run','Windows')][string]$Mode = 'Menu',
     [switch]$Optional, [switch]$Hidden, [switch]$Lenovo,
-    [switch]$Firmware, [switch]$Reboot
+    [switch]$Firmware, [switch]$Hardware, [switch]$Reboot
 )
 '@
     $scriptText = $entry + "`r`nfunction Invoke-Windate {`r`n" + $definition + "`r`n}`r`nInvoke-Windate @PSBoundParameters`r`n"
@@ -1435,6 +1509,7 @@ param(
     if ($hidden) { $launchArgs += '-Hidden' }
     if ($lenovo) { $launchArgs += '-Lenovo' }
     if ($firmware) { $launchArgs += '-Firmware' }
+    if ($hardware) { $launchArgs += '-Hardware' }
     if ($reboot) { $launchArgs += '-Reboot' }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
