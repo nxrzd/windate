@@ -1,8 +1,6 @@
-#requires -RunAsAdministrator
-
 <#
 .SYNOPSIS
-    Verbose, interactive Windows Update installer.
+    Verbose, interactive Windows Update installer with automatic UAC elevation.
 
 .DESCRIPTION
     Searches Windows Update and displays:
@@ -13,14 +11,20 @@
 
     Required updates are selected by default.
 
-    Use -Include-Optional to also select optional updates
+    Use -Include_Optional to also select optional updates
     and drivers.
 
-    Use -Auto-Reboot to automatically restart Windows when
+    Use -Auto_Reboot to automatically restart Windows when
     a reboot is required by this update operation.
 
-    Existing pending reboots do NOT automatically trigger
-    a reboot before searching for updates.
+    If the script is started without Administrator privileges,
+    it automatically requests elevation through UAC.
+
+    The original non-administrator PowerShell process exits
+    immediately after launching the elevated copy.
+
+    Existing pending reboots do NOT automatically trigger a
+    reboot before searching for updates.
 
 .PARAMETER Include_Optional
     Includes optional updates and driver updates.
@@ -32,18 +36,18 @@
 .EXAMPLES
 
     Required updates only:
-        .\Windows_Update_2.1.ps1
+        .\windate.ps1
 
     Required + optional + drivers:
-        .\Windows_Update_2.1.ps1 -Include-Optional
+        .\windate.ps1 -Include_Optional
 
     Required + optional + drivers + automatic reboot:
-        .\Windows_Update_2.1.ps1 -Include-Optional -Auto-Reboot
+        .\windate.ps1 -Include_Optional -Auto_Reboot
 
 .EXIT CODES
 
     0     Success
-    1     Not Administrator
+    1     Not Administrator / UAC cancelled / startup failure
     2     Windows Update initialization failure
     3     Windows Update search failure
     10    User cancelled
@@ -62,6 +66,211 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ============================================================
+# SELF-ELEVATION
+# ============================================================
+#
+# The script intentionally does NOT use:
+#
+#     #requires -RunAsAdministrator
+#
+# because #requires would terminate the script before it could
+# request UAC elevation itself.
+#
+# Instead, the script checks the current process and relaunches
+# itself with "RunAs" when necessary.
+# ============================================================
+
+function Test-IsAdministrator {
+
+    try {
+
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+        $principal = New-Object Security.Principal.WindowsPrincipal(
+            $identity
+        )
+
+        return $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+    }
+    catch {
+
+        return $false
+    }
+}
+
+if (-not (Test-IsAdministrator)) {
+
+    $scriptPath = $MyInvocation.MyCommand.Path
+
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+
+        Write-Host ""
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        Write-Host `
+            "             WINDOWS UPDATE - STARTUP ERROR" `
+            -ForegroundColor Red
+
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        Write-Host ""
+
+        Write-Host `
+            "Unable to determine the path of this script." `
+            -ForegroundColor Yellow
+
+        Write-Host `
+            "Save the script as a .ps1 file and run it again." `
+            -ForegroundColor Yellow
+
+        Write-Host ""
+
+        exit 1
+    }
+
+    # Resolve the full path in case the script was started
+    # using a relative path.
+    try {
+
+        $scriptPath = (Resolve-Path $scriptPath).Path
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host `
+            "Unable to resolve the script path." `
+            -ForegroundColor Red
+
+        exit 1
+    }
+
+    # Determine which PowerShell executable should be used.
+    #
+    # Windows PowerShell:
+    #     powershell.exe
+    #
+    # If the script is running under another compatible host,
+    # fall back to powershell.exe for maximum compatibility.
+    $powerShellExe = "powershell.exe"
+
+    # Build the argument list for the elevated copy.
+    $argumentList = @(
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        "`"$scriptPath`""
+    )
+
+    # Preserve command-line switches.
+    if ($Include_Optional) {
+
+        $argumentList += "-Include_Optional"
+    }
+
+    if ($Auto_Reboot) {
+
+        $argumentList += "-Auto_Reboot"
+    }
+
+    Write-Host ""
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+
+    Write-Host `
+        "             WINDOWS UPDATE - ELEVATION" `
+        -ForegroundColor Cyan
+
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+
+    Write-Host ""
+
+    Write-Host `
+        "Administrator privileges are required." `
+        -ForegroundColor Yellow
+
+    Write-Host `
+        "Requesting elevation through Windows UAC..." `
+        -ForegroundColor Gray
+
+    Write-Host ""
+
+    try {
+
+        # Launch an elevated copy of this exact script.
+        #
+        # -Verb RunAs causes Windows to display the UAC prompt.
+        # -PassThru gives us the newly created process object.
+        $elevatedProcess = Start-Process `
+            -FilePath $powerShellExe `
+            -ArgumentList $argumentList `
+            -Verb RunAs `
+            -PassThru
+
+        if ($null -eq $elevatedProcess) {
+
+            throw "Windows did not return an elevated process."
+        }
+
+        Write-Host `
+            "Elevated PowerShell process started." `
+            -ForegroundColor Green
+
+        Write-Host `
+            "Closing the original non-administrator window..." `
+            -ForegroundColor Gray
+
+        # The original non-elevated process terminates here.
+        #
+        # The elevated process continues independently.
+        exit 0
+    }
+    catch {
+
+        Write-Host ""
+
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        Write-Host `
+            "              ELEVATION CANCELLED" `
+            -ForegroundColor Red
+
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        Write-Host ""
+
+        Write-Host `
+            "Administrator elevation was cancelled or failed." `
+            -ForegroundColor Yellow
+
+        Write-Host ""
+
+        Write-Host `
+            "Windows Update was not started." `
+            -ForegroundColor Gray
+
+        Write-Host ""
+
+        exit 1
+    }
+}
+
+# ============================================================
+# SCRIPT IS NOW ELEVATED
+# ============================================================
+#
+# Nothing below this point executes in the original
+# non-administrator process.
+# ============================================================
 
 # ============================================================
 # DISPLAY FUNCTIONS
@@ -131,6 +340,7 @@ function Write-UpdateEntry {
         -ForegroundColor Yellow
 
     if ($kb) {
+
         Write-Host "$kb " `
             -NoNewline `
             -ForegroundColor Yellow
@@ -139,6 +349,7 @@ function Write-UpdateEntry {
     Write-Host $Update.Title -ForegroundColor White
 
     if ($size -gt 0) {
+
         Write-Host "      Size: $size MB" `
             -ForegroundColor DarkGray
     }
@@ -155,6 +366,7 @@ function Get-KB {
     )
 
     try {
+
         if ($null -ne $Update.KBArticleIDs -and
             $Update.KBArticleIDs.Count -gt 0) {
 
@@ -175,6 +387,7 @@ function Get-SizeMB {
     )
 
     try {
+
         if ($Update.MaxDownloadSize -gt 0) {
 
             return [math]::Round(
@@ -197,13 +410,16 @@ function Test-DriverUpdate {
     )
 
     try {
+
         # Windows Update Agent:
+        #
         # 1 = Software
         # 2 = Driver
 
         return ([int]$Update.Type -eq 2)
     }
     catch {
+
         return $false
     }
 }
@@ -218,7 +434,9 @@ function Test-OptionalUpdate {
     # is not normally offered as an automatic/required update.
 
     try {
+
         if ([bool]$Update.BrowseOnly) {
+
             return $true
         }
     }
@@ -237,10 +455,12 @@ function Get-UpdateType {
     # Drivers are classified separately before optional status.
 
     if (Test-DriverUpdate $Update) {
+
         return "Driver"
     }
 
     if (Test-OptionalUpdate $Update) {
+
         return "Optional"
     }
 
@@ -261,6 +481,7 @@ function Test-PendingReboot {
     foreach ($path in $paths) {
 
         if (Test-Path $path) {
+
             return $true
         }
     }
@@ -305,7 +526,8 @@ function Start-UpdateReboot {
     Write-Host ""
     Write-Host ""
 
-    Write-WarningMessage "Restarting computer..."
+    Write-WarningMessage `
+        "Restarting computer..."
 
     Restart-Computer -Force
 
@@ -351,24 +573,27 @@ else {
     Write-Info "Reboot   : Manual"
 }
 
+Write-Info "Elevated : Administrator"
+
 # ============================================================
 # ADMIN CHECK
 # ============================================================
+#
+# This is a safety check only.
+#
+# The actual elevation occurred at the beginning of the script.
+# If this check fails, something unexpected happened.
+# ============================================================
 
-Write-Step "Checking administrator privileges..."
+Write-Step "Verifying administrator privileges..."
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-
-$principal = New-Object Security.Principal.WindowsPrincipal(
-    $identity
-)
-
-if (-not $principal.IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)) {
+if (-not (Test-IsAdministrator)) {
 
     Write-Failure `
-        "This script must be run as Administrator."
+        "Administrator privileges were not detected."
+
+    Write-Failure `
+        "Windows Update cannot continue."
 
     exit 1
 }
@@ -400,7 +625,8 @@ if ($existingPendingReboot) {
 }
 else {
 
-    Write-Success "No pending reboot detected."
+    Write-Success `
+        "No pending reboot detected."
 }
 
 # ============================================================
@@ -425,7 +651,8 @@ catch {
     Write-Failure `
         "Could not initialize Windows Update."
 
-    Write-Failure $_.Exception.Message
+    Write-Failure `
+        $_.Exception.Message
 
     exit 2
 }
@@ -458,7 +685,8 @@ catch {
     Write-Failure `
         "Windows Update search failed."
 
-    Write-Failure $_.Exception.Message
+    Write-Failure `
+        $_.Exception.Message
 
     exit 3
 }
@@ -470,7 +698,8 @@ $searchSeconds = [math]::Round(
 
 $allUpdates = $searchResult.Updates
 
-Write-Success "Search completed."
+Write-Success `
+    "Search completed."
 
 Write-Info `
     "Search time: $searchSeconds seconds"
@@ -500,20 +729,24 @@ foreach ($update in $allUpdates) {
     switch ($type) {
 
         "Driver" {
+
             [void]$driverUpdates.Add($update)
         }
 
         "Optional" {
+
             [void]$optionalUpdates.Add($update)
         }
 
         default {
+
             [void]$requiredUpdates.Add($update)
         }
     }
 }
 
-Write-Success "Categorization complete."
+Write-Success `
+    "Categorization complete."
 
 # ============================================================
 # DISPLAY REQUIRED
@@ -650,7 +883,7 @@ foreach ($update in $requiredUpdates) {
     [void]$updatesToInstall.Add($update)
 }
 
-# Optional updates and drivers require -Include-Optional.
+# Optional updates and drivers require -Include_Optional.
 
 if ($Include_Optional) {
 
@@ -737,7 +970,8 @@ foreach ($update in $updatesToInstall) {
             Write-WarningMessage `
                 "EULA not yet accepted:"
 
-            Write-Info $update.Title
+            Write-Info `
+                $update.Title
 
             Write-Info `
                 "Windows Update will handle EULA requirements during installation."
@@ -756,7 +990,8 @@ if ($updatesNeedingEula -gt 0) {
         "$updatesNeedingEula update(s) report an unaccepted EULA."
 }
 
-Write-Success "Updates prepared."
+Write-Success `
+    "Updates prepared."
 
 # ============================================================
 # DOWNLOAD
@@ -785,7 +1020,8 @@ catch {
     Write-Failure `
         "Download operation failed."
 
-    Write-Failure $_.Exception.Message
+    Write-Failure `
+        $_.Exception.Message
 
     exit 20
 }
@@ -921,7 +1157,8 @@ catch {
     Write-Failure `
         "Windows Update installation failed."
 
-    Write-Failure $_.Exception.Message
+    Write-Failure `
+        $_.Exception.Message
 
     exit 30
 }
